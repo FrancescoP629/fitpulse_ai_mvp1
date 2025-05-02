@@ -129,5 +129,5 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 ## 📧 Contact
 
-Project Link: [https://github.com/<YOUR_GITHUB_USERNAME>/<YOUR_REPO_NAME>](https://github.com/<YOUR_GITHUB_USERNAME>/<YOUR_REPO_NAME>) <!-- Update -->
+Project Link: https://github.com/FrancescoP629/fitpulse_ai_mvp1
 
