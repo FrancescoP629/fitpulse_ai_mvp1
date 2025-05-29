@@ -4,72 +4,273 @@ name: FitPulse Backend CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, develop ]
     paths:
       - 'backend/**'
       - '.github/workflows/ci.yml'
   pull_request:
-    branches: [ main ]
+    branches: [ main, develop ]
     paths:
       - 'backend/**'
       - '.github/workflows/ci.yml'
 
+env:
+  PYTHON_VERSION: '3.11'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/fitpulse-backend
+
 jobs:
-  build-and-test:
+  lint-and-test:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./backend # Imposta la directory di lavoro predefinita per i passaggi
+        working-directory: ./backend
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.11' # Usa la versione Python specificata o una compatibile
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt', 'backend/requirements-dev.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        # Installa anche le dipendenze per il linting se necessario
-        # pip install flake8 black mypy
+        # Installa dipendenze di sviluppo se esistono
+        if [ -f requirements-dev.txt ]; then
+          pip install -r requirements-dev.txt
+        else
+          # Installa strumenti di linting e testing
+          pip install flake8 black mypy pytest pytest-cov pytest-asyncio
+        fi
 
-    - name: Lint code (Placeholder)
+    - name: Lint with flake8
       run: |
-        echo "Esecuzione linting... (Aggiungere comandi reali come flake8, black, mypy)"
-        # flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # black . --check
-        # mypy .
-        # Per ora, questo passaggio ha successo per impostazione predefinita
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Check code formatting with black
+      run: |
+        black . --check --diff
+
+    - name: Type check with mypy
+      run: |
+        mypy . --ignore-missing-imports --no-strict-optional
+      continue-on-error: true  # MyPy può essere troppo rigido inizialmente
+
+    - name: Security check with bandit
+      run: |
+        pip install bandit[toml]
+        bandit -r . -f json -o bandit-report.json || true
+        bandit -r . --severity-level medium
+      continue-on-error: true
+
+    - name: Prepare test environment
+      run: |
+        # Crea directory per modelli se non esiste
+        mkdir -p model
+        
+        # Se il modello ONNX non esiste, crea un placeholder per i test
+        if [ ! -f model/intensity_model.onnx ]; then
+          echo "Creazione modello ONNX fittizio per i test..."
+          python -c "
+import onnx
+import numpy as np
+from onnx import helper, TensorProto
+
+# Crea un modello ONNX molto semplice per i test
+input_tensor = helper.make_tensor_value_info('input', TensorProto.FLOAT, [1, 10])
+output_tensor = helper.make_tensor_value_info('output', TensorProto.FLOAT, [1, 1])
+
+# Crea un nodo di identità semplice
+node = helper.make_node('Identity', ['input'], ['output'])
+
+# Crea il grafo
+graph = helper.make_graph([node], 'test_model', [input_tensor], [output_tensor])
+
+# Crea il modello
+model = helper.make_model(graph)
+model.opset_import[0].version = 11
+
+# Salva il modello
+onnx.save(model, 'model/intensity_model.onnx')
+print('Modello ONNX fittizio creato con successo')
+" || echo "Impossibile creare modello ONNX, verrà usato un file vuoto"
+          
+          # Fallback: crea un file vuoto se la creazione del modello ONNX fallisce
+          if [ ! -f model/intensity_model.onnx ]; then
+            touch model/intensity_model.onnx
+          fi
+        fi
 
     - name: Run tests with pytest
       run: |
-        # Assicurati che il modello ONNX fittizio esista per i test
-        mkdir -p model
-        touch model/intensity_model.onnx
-        # Esegui pytest (rileva automaticamente i test in tests/)
-        # Il comando viene eseguito dalla directory ./backend
-        # Pytest cercherà i test nella sottocartella 'tests'
-        # È necessario salire di un livello per importare correttamente 'app'
-        # Aggiungiamo la directory corrente al PYTHONPATH
-        export PYTHONPATH=$PYTHONPATH:.
-        pytest tests/
+        # Aggiungi la directory corrente e backend al PYTHONPATH
+        export PYTHONPATH=$PYTHONPATH:.:..
+        
+        # Esegui i test con coverage
+        pytest tests/ \
+          --cov=app \
+          --cov-report=xml \
+          --cov-report=html \
+          --cov-report=term-missing \
+          --junit-xml=pytest-report.xml \
+          -v
 
-    - name: Build Docker image (using docker-compose)
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      if: success()
+      with:
+        file: ./backend/coverage.xml
+        flags: backend
+        name: backend-coverage
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results
+        path: |
+          backend/pytest-report.xml
+          backend/htmlcov/
+          backend/bandit-report.json
+
+  build-docker:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Ensure Dockerfile exists
       run: |
-        echo "Tentativo di build dell'immagine Docker..."
-        # Nota: Questo richiede che Docker e docker-compose siano disponibili nel runner.
-        # Richiede anche un Dockerfile valido in ./backend/Dockerfile
-        # Il docker-compose.yml è nella root, quindi eseguiamo da lì
-        cd .. # Torna alla root del progetto
-        # Crea un Dockerfile fittizio se non esiste, altrimenti il build fallirà
         if [ ! -f backend/Dockerfile ]; then
-          echo "FROM python:3.11-slim\nWORKDIR /app\nCOPY backend/requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY backend/app /app/app\nCOPY backend/model /app/model\nCMD [\"uvicorn\", \"app.main:app\", \"--host\", \"0.0.0.0\", \"--port\", \"8000\"]" > backend/Dockerfile
-          echo "Creato Dockerfile fittizio per CI."
-        fi
-        docker-compose -f docker-compose.yml build backend
-        # Potresti aggiungere un tag e pushare l'immagine a un registry qui
+          echo "Creating production Dockerfile..."
+          cat > backend/Dockerfile << 'EOF'
+        FROM python:3.11-slim
 
+        # Set environment variables
+        ENV PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONUNBUFFERED=1 \
+            PYTHONPATH=/app
+
+        # Set work directory
+        WORKDIR /app
+
+        # Install system dependencies
+        RUN apt-get update \
+            && apt-get install -y --no-install-recommends \
+                gcc \
+                python3-dev \
+            && rm -rf /var/lib/apt/lists/*
+
+        # Install Python dependencies
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir --upgrade pip \
+            && pip install --no-cache-dir -r requirements.txt
+
+        # Copy application code
+        COPY app/ /app/app/
+        COPY model/ /app/model/
+
+        # Create non-root user
+        RUN adduser --disabled-password --gecos '' appuser \
+            && chown -R appuser:appuser /app
+        USER appuser
+
+        # Expose port
+        EXPOSE 8000
+
+        # Health check
+        HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+            CMD curl -f http://localhost:8000/health || exit 1
+
+        # Run the application
+        CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+        EOF
+        fi
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        file: ./backend/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+
+  deploy-staging:
+    needs: build-docker
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+    
+    steps:
+    - name: Deploy to staging
+      run: |
+        echo "🚀 Deploying to staging environment..."
+        echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        # Qui inseriresti i comandi per il deploy effettivo
+        # Ad esempio: kubectl, docker-compose, o script personalizzati
+
+  security-scan:
+    needs: build-docker
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    steps:
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
